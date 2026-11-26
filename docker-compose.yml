@@ -1,0 +1,24 @@
+services:
+  csv-join-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: csv-left-join-api:1.0.0
+    container_name: csv-join-api
+    ports:
+      - "8000:8000"
+    environment:
+      # 不指定时使用容器系统临时目录；每个作业一个 csvjoin-* 子目录，结束即删
+      CSVJOIN_LOG_LEVEL: INFO
+      CSVJOIN_BATCH_SIZE: "1000"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=2).status == 200 else 1)"
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped

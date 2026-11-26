@@ -1,0 +1,5 @@
+request_id,method,path,status,start_time
+req-1001,GET,/api/v1/gateway/route,200,2026-11-26T10:00:01Z
+req-1002,POST,/api/v1/pay,504,2026-11-26T10:00:05Z
+req-1003,GET,/api/v1/health,200,2026-11-26T10:00:09Z
+req-1004,GET,/api/v1/orders/42,200,2026-11-26T10:00:12Z

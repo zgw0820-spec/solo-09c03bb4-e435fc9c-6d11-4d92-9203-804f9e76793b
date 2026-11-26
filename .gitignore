@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+tmp/
+.pytest_tmp/
+examples/big/
+*.big.csv
+*.big.ndjson

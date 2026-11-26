@@ -1,0 +1,7 @@
+request_id,attempt_no,upstream,upstream_status,latency_ms,attempt_ts
+req-1002,1,payments-a,502,120,2026-11-26T10:00:05.100Z
+req-1001,1,router-1,200,44,2026-11-26T10:00:01.200Z
+req-1002,2,payments-b,504,3000,2026-11-26T10:00:08.200Z
+req-1004,1,orders-2,200,88,2026-11-26T10:00:12.100Z
+req-1002,3,payments-a,200,210,2026-11-26T10:00:08.500Z
+req-9999,1,ghost-upstream,200,10,2026-11-26T09:59:00.000Z
