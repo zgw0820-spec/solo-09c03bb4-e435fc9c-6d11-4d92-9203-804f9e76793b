@@ -12,6 +12,7 @@
             {"requests": "<CSV 文本>", "attempts": "<CSV 文本>"}
 
     GET  /healthz         健康检查
+    GET  /diagnostics     建索引 / 正文写入两阶段的在途数与作业秒
     GET  /                用法说明
 
 输出：application/x-ndjson，每行一条记录：
@@ -34,6 +35,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from starlette.datastructures import UploadFile
+from starlette.types import Send
 
 from .join_core import (
     CsvFormatError,
@@ -41,6 +43,7 @@ from .join_core import (
     left_join_ndjson,
     read_header,
 )
+from .metrics import METRICS
 
 logging.basicConfig(
     level=os.environ.get("CSVJOIN_LOG_LEVEL", "INFO"),
@@ -114,6 +117,21 @@ def _canonical_field(name: str) -> str:
 @app.get("/healthz")
 async def healthz() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/diagnostics")
+async def diagnostics() -> JSONResponse:
+    """导出两阶段耗时诊断（常数时间，不遍历在途作业）。
+
+    * ``index``：为 attempts 日志建 SQLite 索引的在途数与累计作业秒；
+    * ``body_write``：写 NDJSON 正文（非空 chunk 的 send）的在途数与
+      累计作业秒；生成下一行的时间不计入；
+    * 每段默认 60 秒（``CSVJOIN_DIAG_SEGMENT_SECONDS`` 可调），返回本段
+      （``current_segment_seconds``）与上一段（``previous_segment_seconds``）；
+    * ``job_seconds_total`` 是自进程启动以来的累计作业秒，并行作业按实数
+      相加（两个作业并行 1 秒 = 2 秒）；未结束阶段算到查询时刻。
+    """
+    return JSONResponse(METRICS.snapshot(), headers={"Cache-Control": "no-store"})
 
 
 _DEMO_HTML = """<!doctype html>
@@ -199,6 +217,7 @@ async def root() -> JSONResponse:
         {
             "service": "csv-request-attempt-left-join",
             "endpoint": "POST /join",
+            "diagnostics": "GET /diagnostics",
             "content_types": [
                 "multipart/form-data (fields: requests, attempts)",
                 "application/json ({\"requests\": csv_text, \"attempts\": csv_text})",
@@ -346,6 +365,57 @@ async def _resolve_json_body(
     )
 
 
+class _TimedJoinResponse(StreamingResponse):
+    """在每次 **非空正文** chunk 的 ``send`` 期间计入 ``body_write`` 在途。
+
+    只包 ``send``，不包“生成下一行”的时间；send 正常返回、抛错或被取消
+    都会在 finally 里把作业移出在途。断连时底层 ``send`` 可能立即返回
+    （此时由 ``request.is_disconnected`` 探针/取消让上游停工），这一段的
+    实际耗时会如实计入。
+    """
+
+    def __init__(self, *args, metrics=None, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._metrics = metrics if metrics is not None else METRICS
+
+    async def stream_response(self, send: Send) -> None:
+        await send(
+            {
+                "type": "http.response.start",
+                "status": self.status_code,
+                "headers": self.raw_headers,
+            }
+        )
+        body_write = self._metrics.body_write
+        async for chunk in self.body_iterator:
+            if not isinstance(chunk, bytes | memoryview):
+                chunk = chunk.encode(self.charset)
+            if chunk:
+                # 准备下一行的时间在 send 之前完成，不计入正文写入
+                body_write.enter()
+                try:
+                    await send(
+                        {
+                            "type": "http.response.body",
+                            "body": chunk,
+                            "more_body": True,
+                        }
+                    )
+                finally:
+                    body_write.exit()
+            else:
+                await send(
+                    {
+                        "type": "http.response.body",
+                        "body": chunk,
+                        "more_body": True,
+                    }
+                )
+        await send(
+            {"type": "http.response.body", "body": b"", "more_body": False}
+        )
+
+
 @app.post("/join")
 @app.post("/api/join")
 @app.post("/v1/join")
@@ -388,6 +458,7 @@ async def join_logs(request: Request) -> StreamingResponse:
                 attempts_binary,
                 job_dir,
                 is_disconnected=request.is_disconnected,
+                metrics=METRICS,
             ):
                 yield line
         except asyncio.CancelledError:
@@ -408,11 +479,12 @@ async def join_logs(request: Request) -> StreamingResponse:
                 job_dir.exists(),
             )
 
-    return StreamingResponse(
+    return _TimedJoinResponse(
         managed_body(),
         media_type="application/x-ndjson; charset=utf-8",
         headers={
             "Cache-Control": "no-store",
             "X-Accel-Buffering": "no",  # 禁 nginx 缓冲，保证逐行可达
         },
+        metrics=METRICS,
     )

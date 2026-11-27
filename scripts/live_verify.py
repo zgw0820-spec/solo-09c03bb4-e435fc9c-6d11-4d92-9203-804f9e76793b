@@ -7,6 +7,8 @@
   C. 整理（索引）尝试日志阶段客户端断开：尽快停止、有日志、临时目录清理
   D. 300 万匹配行单请求：结果条数正确，服务器 RSS 不随匹配行数膨胀
   E. 两个并发作业：各自结果正确，结束后临时目录全部清理
+  F. 诊断 API：索引慢与正文慢两种场景能分开报，在途数/作业秒符合口径
+     （本脚本用 CSVJOIN_DIAG_SEGMENT_SECONDS=2 缩小分段便于观察跨段）
 
 运行：
   PYTHONPATH=/tmp/pylibs python3 scripts/live_verify.py
@@ -23,6 +25,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 from pathlib import Path
@@ -79,6 +82,9 @@ def start_server() -> subprocess.Popen:
     env = os.environ.copy()
     env["CSVJOIN_TMPDIR"] = str(TMPROOT)
     env["CSVJOIN_PROGRESS_EVERY"] = "100000"
+    env["CSVJOIN_DIAG_SEGMENT_SECONDS"] = os.environ.get(
+        "CSVJOIN_DIAG_SEGMENT_SECONDS", "2"
+    )
     env["PYTHONUNBUFFERED"] = "1"
     proc = subprocess.Popen(
         [
@@ -367,6 +373,303 @@ def scenario_concurrent() -> None:
     check("E 并发作业后无临时目录残留", wait_no_leftovers())
 
 
+def scenario_diagnostics() -> None:
+    """F：分别制造“建索引慢”和“正文写慢”，用 /diagnostics 区分。"""
+    diag_req = DATA / "diag_requests.csv"
+    diag_att = DATA / "diag_attempts.csv"
+    diag_req.write_text("request_id,path\nhot,/hot\n", encoding="utf-8")
+    n_index = int(os.environ.get("DIAG_INDEX_ROWS", "600000"))
+    with diag_att.open("w", encoding="utf-8") as f:
+        f.write("request_id,n\n")
+        for i in range(n_index):
+            f.write(f"r{i % 97},{i}\n")
+
+    body_req = DATA / "diag_body_requests.csv"
+    body_att = DATA / "diag_body_attempts.csv"
+    pad = "y" * 32768
+    n_body = int(os.environ.get("DIAG_BODY_ROWS", "300"))
+    with body_req.open("w", encoding="utf-8") as f:
+        f.write("request_id,pad\n")
+        for i in range(n_body):
+            f.write(f"b{i},{pad}\n")
+    body_att.write_text("request_id,n\n", encoding="utf-8")
+
+    def diag() -> dict:
+        with urllib.request.urlopen(f"{BASE}/diagnostics", timeout=3) as r:
+            return json.load(r)
+
+    def phase_seconds(snap: dict, name: str) -> float:
+        return float(snap["phases"][name]["job_seconds_total"])
+
+    def wait_gone() -> bool:
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            snap = diag()
+            if snap["phases"]["index"]["in_flight"] == 0 and (
+                snap["phases"]["body_write"]["in_flight"] == 0
+            ):
+                return True
+            time.sleep(0.1)
+        return False
+
+    base = diag()
+    self_check = (
+        set(base["phases"]) == {"index", "body_write"}
+        and base["process"]["segment_seconds"] == 2.0
+        and base["totals"]["in_flight"] == 0
+    )
+    check("F /diagnostics 结构与本进程分段", self_check, f"segment={base['process']['segment_seconds']}")
+
+    # --- F1：大 attempts、输出 1 行 -> index 在途、耗时增长 -------------
+    index_before = phase_seconds(base, "index")
+    body_before = phase_seconds(base, "body_write")
+    curl = subprocess.Popen(
+        [
+            "curl", "-sS", "-N",
+            "-F", f"requests=@{diag_req}",
+            "-F", f"attempts=@{diag_att}",
+            f"{BASE}/join",
+            "-o", os.devnull,
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    saw_index_in_flight = False
+    index_growth_while_running = 0.0
+    body_growth_while_running = 0.0
+    t0 = time.time()
+    while curl.poll() is None and time.time() - t0 < 120:
+        snap = diag()
+        if snap["phases"]["index"]["in_flight"] >= 1:
+            saw_index_in_flight = True
+            index_growth_while_running = (
+                phase_seconds(snap, "index") - index_before
+            )
+            body_growth_while_running = (
+                phase_seconds(snap, "body_write") - body_before
+            )
+        time.sleep(0.1)
+    curl.wait(timeout=30)
+    wait_gone()
+    after_index = diag()
+    index_delta = phase_seconds(after_index, "index") - index_before
+    body_delta = phase_seconds(after_index, "body_write") - body_before
+
+    check(
+        "F1 建索引场景：诊断中 index 在途 >= 1",
+        saw_index_in_flight,
+        f"index 累计={index_delta:.2f}s",
+    )
+    check(
+        "F1 建索引场景：index 作业秒显著增长、body 几乎不动",
+        index_delta > 0.5 and index_delta > body_delta * 5,
+        f"index={index_delta:.2f}s body={body_delta:.2f}s "
+        f"运行中index={index_growth_while_running:.2f}s "
+        f"运行中body={body_growth_while_running:.2f}s",
+    )
+    check(
+        "F1 建索引场景：结束后 index 不再在途",
+        after_index["phases"]["index"]["in_flight"] == 0,
+    )
+
+    # --- F2：无尝试、每行 32KiB、客户端读一小段后停住 -> body 在途 -------
+    # curl 的 --limit-rate 只在小响应上有用：响应一旦进入内核缓冲，
+    # send 立即返回，计量窗口太短。这里用标准库客户端读到 512KiB 后
+    # 主动停读 hold 秒，逼出真实 TCP 背压，采样稳定。
+    index_before = phase_seconds(after_index, "index")
+    body_before = phase_seconds(after_index, "body_write")
+
+    def start_slow_reader(hold: float) -> tuple[threading.Thread, dict]:
+        state: dict = {}
+
+        def worker() -> None:
+            try:
+                _post_multipart_slow(
+                    f"{BASE}/join",
+                    body_req,
+                    body_att,
+                    read_bytes=512 * 1024,
+                    hold=hold,
+                    state=state,
+                )
+            except Exception as exc:  # noqa: BLE001
+                state["error"] = repr(exc)
+
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+        return thread, state
+
+    reader, reader_state = start_slow_reader(hold=4.0)
+    saw_body_in_flight = False
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        snap = diag()
+        if snap["phases"]["body_write"]["in_flight"] >= 1:
+            saw_body_in_flight = True
+            break
+        if "error" in reader_state or not reader.is_alive():
+            break
+        time.sleep(0.05)
+
+    if saw_body_in_flight:
+        t_sample = time.time()
+        a = diag()
+        time.sleep(2.5)
+        b = diag()
+        window = time.time() - t_sample
+        body_growth_while_running = phase_seconds(b, "body_write") - phase_seconds(
+            a, "body_write"
+        )
+        index_growth_while_running = phase_seconds(b, "index") - phase_seconds(
+            a, "index"
+        )
+        body_in_flight_while_stopped = b["phases"]["body_write"]["in_flight"]
+    else:
+        window = 0.0
+        body_in_flight_while_stopped = 0
+        body_growth_while_running = 0.0
+        index_growth_while_running = 0.0
+    reader.join(timeout=60)
+    wait_gone()
+    after_body = diag()
+    body_delta = phase_seconds(after_body, "body_write") - body_before
+    index_delta = phase_seconds(after_body, "index") - index_before
+
+    check(
+        "F2 慢写场景：诊断中 body_write 在途 >= 1",
+        saw_body_in_flight,
+        f"reader={reader_state}",
+    )
+    check(
+        "F2 慢写场景：客户端停读期间 body 作业秒持续增长",
+        body_growth_while_running > 1.0
+        and body_in_flight_while_stopped >= 1,
+        f"{window:.1f}s 窗口内 body +{body_growth_while_running:.2f}s "
+        f"in_flight={body_in_flight_while_stopped} "
+        f"index +{index_growth_while_running:.2f}s",
+    )
+    check(
+        "F2 慢写场景：body 增长明显大于 index",
+        body_delta > index_delta + 0.5,
+        f"body={body_delta:.2f}s index={index_delta:.2f}s",
+    )
+    check(
+        "F2 慢写场景：结束后 body 不再在途",
+        after_body["phases"]["body_write"]["in_flight"] == 0,
+    )
+
+    # --- F3：分段返回本段 / 上一段，且 totals 自洽 ----------------------
+    snap = diag()
+    seg_ok = all(
+        set(p) == {
+            "in_flight",
+            "job_seconds_total",
+            "current_segment_seconds",
+            "previous_segment_seconds",
+        }
+        for p in snap["phases"].values()
+    )
+    totals_ok = snap["totals"]["job_seconds_total"] == round(
+        snap["phases"]["index"]["job_seconds_total"]
+        + snap["phases"]["body_write"]["job_seconds_total"],
+        3,
+    )
+    check("F3 返回本段/上一段且 totals 自洽", seg_ok and totals_ok,
+          f"totals={snap['totals']}")
+
+    # --- F4：两笔并发慢写作业：并行一秒应计两秒 -------------------------
+    base4 = diag()
+    body_before = phase_seconds(base4, "body_write")
+    pairs = [start_slow_reader(hold=5.0) for _ in range(2)]
+    both_in_flight = False
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        snap = diag()
+        if snap["phases"]["body_write"]["in_flight"] == 2:
+            both_in_flight = True
+            break
+        if any("error" in st for _, st in pairs):
+            break
+        time.sleep(0.05)
+    t_sample = time.time()
+    a = diag()
+    time.sleep(2.0)
+    b = diag()
+    window = time.time() - t_sample
+    growth = phase_seconds(b, "body_write") - phase_seconds(a, "body_write")
+    for thread, _state in pairs:
+        thread.join(timeout=60)
+    wait_gone()
+    body_delta = phase_seconds(diag(), "body_write") - body_before
+    # 两个作业并行被背压堵住约 2s：累计作业秒应接近 2 × 窗口，
+    # 而不是墙钟 2s（并行一秒算两秒）。
+    check(
+        "F4 并行作业秒按实数相加",
+        both_in_flight and growth >= window * 1.5,
+        f"in_flight=2 growth={growth:.2f}s / wall={window:.2f}s "
+        f"双作业 body +{body_delta:.2f}s",
+    )
+    check("F 诊断场景后无临时目录残留", wait_no_leftovers())
+
+
+def _post_multipart_slow(
+    url: str,
+    requests_path: Path,
+    attempts_path: Path,
+    *,
+    read_bytes: int,
+    hold: float,
+    state: dict,
+) -> None:
+    """读一小段后停读 hold 秒，再读完全部；用于制造正文 send 背压。"""
+    boundary = "----csvjoin-live-verify"
+    head = (
+        f"--{boundary}\r\n"
+        'Content-Disposition: form-data; name="requests"; '
+        'filename="requests.csv"\r\n'
+        "Content-Type: text/csv\r\n\r\n"
+    ).encode()
+    mid = (
+        f"\r\n--{boundary}\r\n"
+        'Content-Disposition: form-data; name="attempts"; '
+        'filename="attempts.csv"\r\n'
+        "Content-Type: text/csv\r\n\r\n"
+    ).encode()
+    tail = f"\r\n--{boundary}--\r\n".encode()
+    body = (
+        head
+        + requests_path.read_bytes()
+        + mid
+        + attempts_path.read_bytes()
+        + tail
+    )
+    req = urllib.request.Request(
+        url,
+        data=body,
+        method="POST",
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+    )
+    started = time.time()
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        got = 0
+        while got < read_bytes:
+            chunk = resp.read(16384)
+            if not chunk:
+                break
+            got += len(chunk)
+        state["stalled_at"] = round(time.time() - started, 3)
+        state["bytes_before_hold"] = got
+        time.sleep(hold)
+        rest = 0
+        while True:
+            chunk = resp.read(65536)
+            if not chunk:
+                break
+            rest += len(chunk)
+        state["rest_bytes"] = rest
+        state["total_seconds"] = round(time.time() - started, 3)
+
+
 def main() -> int:
     if VERIFY_DIR.exists():
         shutil.rmtree(VERIFY_DIR, ignore_errors=True)
@@ -379,6 +682,7 @@ def main() -> int:
         scenario_index_disconnect(server)
         scenario_rss(server)
         scenario_concurrent()
+        scenario_diagnostics()
     finally:
         if server is not None:
             server.send_signal(signal.SIGTERM)

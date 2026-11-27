@@ -30,6 +30,8 @@ import sqlite3
 from pathlib import Path
 from typing import Awaitable, BinaryIO, Callable, AsyncIterator
 
+from .metrics import METRICS, JoinPhaseMetrics
+
 logger = logging.getLogger("csvjoin")
 
 JOIN_KEY = "request_id"
@@ -149,18 +151,23 @@ async def left_join_ndjson(
     *,
     batch_size: int = DEFAULT_BATCH_SIZE,
     is_disconnected: DisconnectCheck | None = None,
+    metrics: JoinPhaseMetrics | None = None,
 ) -> AsyncIterator[str]:
     """执行左联接，逐行 yield NDJSON 字符串（每行以 \\n 结尾）。
 
     生成器结束 / 被取消时保证关闭 SQLite 连接和 CSV 文本包装器
     （关闭包装器会连带关闭传入的二进制流，例如 UploadFile.file）。
     临时目录本身由调用方负责删除。
+
+    索引阶段在途数计入 ``metrics.index``；正文写入由 HTTP 层的
+    StreamingResponse 在每次非空 send 前后计入 ``metrics.body_write``。
     """
     job_dir = Path(job_dir)
     db_path = job_dir / "attempts.sqlite3"
     conn: sqlite3.Connection | None = None
     attempts_text: io.TextIOWrapper | None = None
     requests_text: io.TextIOWrapper | None = None
+    tracking = metrics if metrics is not None else METRICS
 
     if batch_size <= 0:
         batch_size = DEFAULT_BATCH_SIZE
@@ -172,92 +179,94 @@ async def left_join_ndjson(
 
         # ------------------------------------------------------------------
         # 阶段 1：尝试日志全量扫描一次 -> 磁盘 SQLite 索引（固定批次提交）
+        # 在途数只在真正整理索引期间保持；结束 / 异常 / 取消都立即离开。
         # ------------------------------------------------------------------
-        conn = connect_index(db_path)
-        attempts_text = io.TextIOWrapper(
-            attempts_binary, encoding="utf-8-sig", newline=""
-        )
-        attempts_reader = csv.reader(attempts_text)
-        try:
-            raw_attempts_header = next(attempts_reader)
-        except StopIteration as exc:
-            raise CsvFormatError("attempts CSV 为空，缺少表头行") from exc
-        except UnicodeDecodeError as exc:
-            raise CsvFormatError(f"attempts CSV 不是合法 UTF-8: {exc}") from exc
-
-        attempts_header = [normalise_header(h) for h in raw_attempts_header]
-        attempts_rid_idx = find_join_column(attempts_header)
-        if attempts_rid_idx < 0:
-            raise CsvFormatError("attempts CSV 缺少 request_id 列")
-
-        batch: list[tuple[str, int, str]] = []
-        seq = 0
-        indexed = 0
-        last_progress_mark = 0
-
-        for row in attempts_reader:
-            if not row:  # 跳过纯空行（csv.reader 对空行返回 []）
-                continue
-            seq += 1
-            raw_rid = (
-                row[attempts_rid_idx]
-                if attempts_rid_idx < len(row)
-                else ""
+        with tracking.index.track():
+            conn = connect_index(db_path)
+            attempts_text = io.TextIOWrapper(
+                attempts_binary, encoding="utf-8-sig", newline=""
             )
-            attempt_obj = row_to_object(attempts_header, row)
-            batch.append(
-                (
-                    raw_rid if raw_rid is not None else "",
-                    seq,
-                    json.dumps(
-                        attempt_obj, ensure_ascii=False, separators=(",", ":")
-                    ),
+            attempts_reader = csv.reader(attempts_text)
+            try:
+                raw_attempts_header = next(attempts_reader)
+            except StopIteration as exc:
+                raise CsvFormatError("attempts CSV 为空，缺少表头行") from exc
+            except UnicodeDecodeError as exc:
+                raise CsvFormatError(f"attempts CSV 不是合法 UTF-8: {exc}") from exc
+
+            attempts_header = [normalise_header(h) for h in raw_attempts_header]
+            attempts_rid_idx = find_join_column(attempts_header)
+            if attempts_rid_idx < 0:
+                raise CsvFormatError("attempts CSV 缺少 request_id 列")
+
+            batch: list[tuple[str, int, str]] = []
+            seq = 0
+            indexed = 0
+            last_progress_mark = 0
+
+            for row in attempts_reader:
+                if not row:  # 跳过纯空行（csv.reader 对空行返回 []）
+                    continue
+                seq += 1
+                raw_rid = (
+                    row[attempts_rid_idx]
+                    if attempts_rid_idx < len(row)
+                    else ""
                 )
-            )
+                attempt_obj = row_to_object(attempts_header, row)
+                batch.append(
+                    (
+                        raw_rid if raw_rid is not None else "",
+                        seq,
+                        json.dumps(
+                            attempt_obj, ensure_ascii=False, separators=(",", ":")
+                        ),
+                    )
+                )
 
-            if len(batch) >= batch_size:
-                inserted = len(batch)
+                if len(batch) >= batch_size:
+                    inserted = len(batch)
+                    conn.executemany(
+                        "INSERT INTO attempt_index(request_id, seq, payload)"
+                        " VALUES (?, ?, ?)",
+                        batch,
+                    )
+                    conn.commit()
+                    indexed += inserted
+                    batch.clear()
+
+                    if (
+                        PROGRESS_EVERY
+                        and indexed // PROGRESS_EVERY > last_progress_mark
+                    ):
+                        last_progress_mark = indexed // PROGRESS_EVERY
+                        logger.info(
+                            "job=%s indexed %d attempt rows", job_dir.name, indexed
+                        )
+
+                    # 断连探针 + 事件循环让出点：真实断连的取消也在这里落地
+                    if await _client_gone(is_disconnected):
+                        logger.info(
+                            "job=%s client gone during indexing at row %d, stopping",
+                            job_dir.name,
+                            indexed,
+                        )
+                        return
+                    await asyncio.sleep(0)
+
+            if batch:
                 conn.executemany(
                     "INSERT INTO attempt_index(request_id, seq, payload)"
                     " VALUES (?, ?, ?)",
                     batch,
                 )
                 conn.commit()
-                indexed += inserted
+                indexed += len(batch)
                 batch.clear()
 
-                if (
-                    PROGRESS_EVERY
-                    and indexed // PROGRESS_EVERY > last_progress_mark
-                ):
-                    last_progress_mark = indexed // PROGRESS_EVERY
-                    logger.info(
-                        "job=%s indexed %d attempt rows", job_dir.name, indexed
-                    )
-
-                # 断连探针 + 事件循环让出点：真实断连的取消也在这里落地
-                if await _client_gone(is_disconnected):
-                    logger.info(
-                        "job=%s client gone during indexing at row %d, stopping",
-                        job_dir.name,
-                        indexed,
-                    )
-                    return
-                await asyncio.sleep(0)
-
-        if batch:
-            conn.executemany(
-                "INSERT INTO attempt_index(request_id, seq, payload)"
-                " VALUES (?, ?, ?)",
-                batch,
+            logger.info(
+                "job=%s attempt index ready: %d rows", job_dir.name, indexed
             )
-            conn.commit()
-            indexed += len(batch)
-            batch.clear()
-
-        logger.info(
-            "job=%s attempt index ready: %d rows", job_dir.name, indexed
-        )
 
         # ------------------------------------------------------------------
         # 阶段 2：按请求文件行序逐行做左联接，逐 pair 输出

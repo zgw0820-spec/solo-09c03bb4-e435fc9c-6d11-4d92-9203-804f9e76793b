@@ -11,6 +11,8 @@ services:
       # 不指定时使用容器系统临时目录；每个作业一个 csvjoin-* 子目录，结束即删
       CSVJOIN_LOG_LEVEL: INFO
       CSVJOIN_BATCH_SIZE: "1000"
+      # /diagnostics 的分段长度（秒），默认 60
+      CSVJOIN_DIAG_SEGMENT_SECONDS: "60"
     healthcheck:
       test:
         - CMD

@@ -22,7 +22,8 @@ docker compose up --build
 ```
 
 服务监听容器内 `8000`，并映射到宿主机 <http://127.0.0.1:8000>。
-镜像以非 root 用户运行，自带 HEALTHCHECK。
+镜像以非 root 用户运行，自带 HEALTHCHECK。诊断分段长度可用环境变量
+`CSVJOIN_DIAG_SEGMENT_SECONDS`（默认 60）调整，`docker-compose.yml` 已带上。
 
 本地直接用 Python 跑（Python 3.11+）：
 
@@ -78,8 +79,85 @@ with open("examples/requests.csv","rb") as f1, open("examples/attempts.csv","rb"
 | 记录结构 | `{"request": {列: 值}, "attempt": {列: 值} \| null}`，CSV 值一律按字符串保留 |
 | 客户端错误 | 缺文件 / 缺 `request_id` 列 / 空 CSV → `400`；不支持的 Content-Type → `415`，均为 JSON 错误 |
 | 健康检查 | `GET /healthz` → `{"status":"ok"}` |
+| 诊断 | `GET /diagnostics` → 建索引 / 正文写入两阶段的在途数与累计作业秒，见第 4 节 |
 
-## 3. 内存、断连、清理是怎么保证的
+## 3. 诊断：到底是建索引慢，还是正文写不动
+
+`GET /diagnostics` 把 `/join` 的两段工作分开报，返回示例：
+
+```json
+{
+  "process": {"uptime_seconds": 812.4, "segment_seconds": 60.0,
+              "current_segment": 13, "previous_segment": 12},
+  "phases": {
+    "index": {"in_flight": 1, "job_seconds_total": 271.6,
+              "current_segment_seconds": 23.1, "previous_segment_seconds": 60.0},
+    "body_write": {"in_flight": 3, "job_seconds_total": 512.0,
+                   "current_segment_seconds": 18.4, "previous_segment_seconds": 44.7}
+  },
+  "totals": {"in_flight": 4, "job_seconds_total": 783.6,
+             "current_segment_seconds": 41.5, "previous_segment_seconds": 104.7}
+}
+```
+
+口径（实现见 `app/metrics.py`）：
+
+| 项 | 含义 |
+| --- | --- |
+| `index` | 为 attempts 日志建磁盘 SQLite 索引的在途作业数与累计耗时 |
+| `body_write` | 每次**非空** NDJSON 正文 chunk 的 `send` 从发起到返回/中止的耗时；两次 send 之间“生成下一行”的时间**不算** |
+| `in_flight` | 当前处于该阶段的作业数。作业断开或失败后立即不再算在途，但已耗时间照算 |
+| `job_seconds_total` | 自进程启动以来该阶段的**累计作业秒**：每个作业的在途时长相加，两笔作业并行 1 秒记 2 秒 |
+| `current_segment_seconds` | 本段（默认 60 秒，`CSVJOIN_DIAG_SEGMENT_SECONDS` 可调）内的作业秒 |
+| `previous_segment_seconds` | 上一段的作业秒；跨段作业按实际耗时拆到各段 |
+| 未结束阶段 | 按“到查询时刻为止”计入 |
+
+统计**不保存逐行或逐作业历史**：每个阶段只维护在途计数、累计值和最近
+两个段桶，进入/离开/查询时按 `在途数 × Δt` 积分。因此查询是常数时间，
+不会遍历在途作业，内存也不随作业数或运行时长增长。
+分段起点是进程启动（模块导入）时刻。
+
+### 对照示例：区分两种变慢
+
+`examples/diagnose.py` 只用标准库，在作业进行中每 0.5s 采一次
+`/diagnostics`，并排打印两阶段耗时：
+
+```bash
+# 服务启动后
+python3 examples/diagnose.py index   # 大 attempts、输出仅 1 行
+python3 examples/diagnose.py body    # 无尝试、大行慢读客户端
+python3 examples/diagnose.py         # 两个都跑
+```
+
+实测输出（Python 3.11 + uvicorn，分段 5s）：
+
+```text
+=== 场景 index（大 attempts、输出仅 1 行）：墙钟 4.1s ===
+ t(s)    index 在途    index 作业秒    body 在途    body 作业秒
+  0.5           1         0.36          0        0.00
+  1.5           1         1.38          0        0.00
+  2.5           1         2.40          0        0.00
+  3.6           1         3.41          0        0.00
+  4.1           0         3.91          0        0.00
+本次作业累计：index=3.91s  body_write=0.00s
+=> 主要时间在【建索引】：尝试日志大，整理 SQLite 索引是瓶颈。
+
+=== 场景 body（无尝试、300 行大正文、客户端慢读）：墙钟 18.1s ===
+ t(s)    index 在途    index 作业秒    body 在途    body 作业秒
+  0.5           0         3.91          1        0.42
+  4.0           0         3.91          1        3.90
+  8.0           0         3.91          1        7.88
+ 12.0           0         3.91          1       11.87
+ 12.5           0         3.91          0       11.90
+本次作业累计：index=0.00s  body_write=11.90s
+=> 主要时间在【正文写入】：客户端/网络读得慢，写 NDJSON 被背压拖住。
+```
+
+值班判断方法：`index` 高是尝试日志大、索引整理慢；`body_write` 高是
+客户端/网络消费慢。两者都高时按段内数值比较；`job_seconds_total` 按
+并行实数相加，多作业并发不会被墙钟稀释。
+
+## 4. 内存、断连、清理是怎么保证的
 
 核心代码在 `app/join_core.py`，HTTP/生命周期在 `app/main.py`。
 
@@ -129,21 +207,25 @@ with open("examples/requests.csv","rb") as f1, open("examples/attempts.csv","rb"
    连带关闭 `UploadFile.file`，其 spool 临时文件也会立即删除。
    每个作业一个目录，并发请求互不干扰。
 
-## 4. 试跑验证结果（交付前对照改动执行）
+## 5. 试跑验证结果（交付前对照改动执行）
 
-### 4.1 自动化测试：27/27 通过
+### 5.1 自动化测试：40/40 通过
 
 ```bash
 pip install -r requirements-dev.txt
 PYTHONPATH=. python3 -m pytest
-# 27 passed
+# 40 passed
 ```
 
 覆盖：左联接顺序 / 一对多 / `attempt=null` / 孤儿尝试不输出 /
 空 attempts / 重复请求行 / 空行与中文 UTF-8 / 缺 `request_id` 报错 /
 索引阶段断连早停 / `aclose()` 取消清理 / 查询计划走主键 /
 multipart 多别名字段 / 任意两文件兜底 / JSON / urlencoded / 400 / 415 /
-正常与校验失败后的临时目录清理 / 仓库示例文件端到端。
+正常与校验失败后的临时目录清理 / 仓库示例文件端到端；
+以及诊断统计（`tests/test_diagnostics.py` 13 例）：
+并行作业秒相加 / 跨段拆分 / 只留本段与上一段 / 未结束阶段算到查询时刻 /
+失败与取消后不再在途而耗时保留 / 正文计时只包非空 send 不计生成时间 /
+索引阶段进出在途 / `/diagnostics` 结构与真实作业接线。
 
 内存恒定性用 `tracemalloc` 做了 2 万 vs 20 万匹配行的对照
 （`tests/test_join_core.py::test_memory_does_not_grow_with_match_count`）：
@@ -154,7 +236,7 @@ tracemalloc peak: 20k=0.32 MiB   200k=0.26 MiB
 
 10 倍匹配行数，峰值分配没有增长（断言增量 < 8 MiB、绝对值 < 30 MiB）。
 
-### 4.2 真实 uvicorn + curl 现场：14/14 通过
+### 5.2 真实 uvicorn 现场：25/25 通过
 
 ```bash
 PYTHONPATH=/tmp/pylibs python3 scripts/live_verify.py
@@ -181,28 +263,52 @@ PYTHONPATH=/tmp/pylibs python3 scripts/live_verify.py
 [PASS] D 正常大作业后临时目录清理
 [PASS] E 两个并发作业均得到 6 行
 [PASS] E 并发作业后无临时目录残留
-14/14 passed
+[PASS] F /diagnostics 结构与本进程分段
+[PASS] F1 建索引场景：诊断中 index 在途 >= 1
+[PASS] F1 建索引场景：index 作业秒显著增长、body 几乎不动
+       index=6.78s body=0.00s 运行中index=6.72s 运行中body=0.00s
+[PASS] F1 建索引场景：结束后 index 不再在途
+[PASS] F2 慢写场景：诊断中 body_write 在途 >= 1
+[PASS] F2 慢写场景：客户端停读期间 body 作业秒持续增长
+       2.5s 窗口内 body +2.50s in_flight=1 index +0.00s
+[PASS] F2 慢写场景：body 增长明显大于 index
+       body=3.97s index=0.00s
+[PASS] F2 慢写场景：结束后 body 不再在途
+[PASS] F3 返回本段/上一段且 totals 自洽
+       totals={'in_flight': 0, 'job_seconds_total': 18.271,
+               'current_segment_seconds': 1.063, 'previous_segment_seconds': 2.0}
+[PASS] F4 并行作业秒按实数相加
+       in_flight=2 growth=4.00s / wall=2.00s 双作业 body +9.91s
+[PASS] F 诊断场景后无临时目录残留
+25/25 passed
 ```
 
-## 5. 目录结构
+F 组用 `CSVJOIN_DIAG_SEGMENT_SECONDS=2` 缩小分段；`index` 场景喂 60 万行
+attempts 并观察其累计；`body_write` 场景让标准库客户端读 512KiB 后停读
+4 秒，制造真实 TCP 背压；F4 同时跑两个这样的客户端，证明并行作业秒
+在 2 秒墙钟内累计约 4 秒（并行一秒算两秒）。
+
+## 6. 目录结构
 
 ```text
 app/
   main.py          # FastAPI 路由、入参兼容、StreamingResponse、作业目录清理
   join_core.py     # 一次性 SQLite 磁盘索引 + 逐行左联接算子（不依赖 Web 层）
+  metrics.py       # 两阶段在途数 / 累计作业秒的 O(1) 聚合与分段快照
 examples/
   requests.csv / attempts.csv
   expected-output.ndjson
   call-api.sh / call_api_python.py
-tests/             # pytest 算子级 + HTTP 级用例
+  diagnose.py      # 对照“建索引慢 / 正文写慢”的诊断示例
+tests/             # pytest 算子级 + HTTP 级 + 诊断统计用例
 scripts/
-  live_verify.py   # 真实服务器断连 / 清理 / RSS 验证（标准库 + curl）
+  live_verify.py   # 真实服务器断连 / 清理 / RSS / 诊断 API 验证
 Dockerfile
 docker-compose.yml
 requirements.txt / requirements-dev.txt
 ```
 
-## 6. 还有哪些没做 / 已知边界（如实说明）
+## 7. 还有哪些没做 / 已知边界（如实说明）
 
 - **本沙箱没有 Docker / daemon**，因此 `docker compose up --build`
   没能在我这边实际执行；已用 PyYAML 校验 compose 结构，并用等价的
@@ -223,3 +329,13 @@ requirements.txt / requirements-dev.txt
   以免污染正常记录 schema。
 - 没有做按 `request_id` 过滤 / 时间范围裁剪等额外查询参数，
   严格按两份文件全量左联接实现。
+- **诊断口径的边界**：`body_write` 计的是“应用层 `send` 阻塞时长”。
+  ASGI 2.3 的 `send` 在传输层缓冲未满时会立即返回（真正的背压通过
+  uvicorn 的 flow-control `drain` 体现），因此对“客户端读得很慢但内核对
+  缓冲尚未打满”的连接，正文斜率可能低于主观变慢程度；一旦缓冲打满、
+  `send` 真的被堵住，耗时会如实累计（F2 场景实测 2.5s 窗口 +2.50s）。
+  这是在不改协议的前提下可观测到的最大口径，未额外插桩 socket 层。
+- 诊断是进程级聚合，不区分请求 / 租户；不保留逐作业或逐行历史，
+  因此无法事后回放某个具体作业在哪个阶段慢，只能看当前与最近两段。
+- 多 worker 部署时每个进程各自计时，需要按副本汇总。
+- 统计只覆盖 `/join` 的两段；上传解析、响应头等开销不计入任何阶段。
